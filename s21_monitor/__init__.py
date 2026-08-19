@@ -20,7 +20,7 @@ from .filters import (
 )
 from .transmitter import WidelyLinearTransmitter, make_transmitter
 from .photodetector import photodetect
-from .monitor import MonitorResult, fit_monitor
+from .monitor import MonitorResult, fit_monitor, fit_monitor_hybrid
 from .metrics import analyze_iq, branch_responses
 
 __all__ = [
@@ -34,6 +34,7 @@ __all__ = [
     "photodetect",
     "MonitorResult",
     "fit_monitor",
+    "fit_monitor_hybrid",
     "analyze_iq",
     "branch_responses",
 ]

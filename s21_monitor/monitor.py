@@ -75,6 +75,7 @@ def fit_monitor(
     lr: float = 5e-3,
     lr_final: float | None = None,
     optimizer: str = "adam",
+    domain: str = "tap",
     lr_L: float | None = None,
     lr_M: float | None = None,
     init_L: np.ndarray | None = None,
@@ -95,6 +96,14 @@ def fit_monitor(
     optimizer : "adam" (default, fast batch convergence) or "gd"
         (plain gradient descent, i.e. batch LMS as in the paper; use
         lr_L / lr_M as the step sizes beta_L / beta_M).
+    domain : parameterization of Lhat for the Adam optimizer. "tap"
+        updates the impulse-response taps directly. "freq" updates the
+        DFT bins of Lhat instead: Adam's per-parameter step adaptation
+        then equalizes the convergence rate across frequency, which
+        greatly improves accuracy at weakly excited frequencies (band
+        edges) where the tap-domain gradient is vanishingly small. The
+        gradient of a real filter is Hermitian, so the taps stay real.
+        See ``fit_monitor_hybrid`` for the recommended combination.
     init_L, init_M : optional initial filters. By default Lhat starts as
         a centered identity (delta) response and Mhat as a centered
         delta scaled by a least-squares gain fit.
@@ -125,8 +134,18 @@ def fit_monitor(
     # Normalize the loss scale so step sizes are data-independent.
     inv_n = 1.0 / N
 
+    if domain not in ("tap", "freq"):
+        raise ValueError("domain must be 'tap' or 'freq'")
+    if domain == "freq" and optimizer != "adam":
+        raise ValueError("domain='freq' requires optimizer='adam'")
+
     if optimizer == "adam":
-        mL = np.zeros_like(L); vL = np.zeros_like(L)
+        if domain == "freq":
+            Lf = np.fft.fft(L, axis=-1)
+            mLf = np.zeros_like(Lf)
+            vLr = np.zeros(Lf.shape); vLi = np.zeros(Lf.shape)
+        else:
+            mL = np.zeros_like(L); vL = np.zeros_like(L)
         mM = np.zeros_like(M); vM = np.zeros_like(M)
         b1, b2, eps = 0.9, 0.999, 1e-12
     elif optimizer == "gd":
@@ -179,13 +198,29 @@ def fit_monitor(
                 )
             else:
                 step = lr
-            mL = b1 * mL + (1 - b1) * grad_L
-            vL = b2 * vL + (1 - b2) * grad_L**2
+            if domain == "freq":
+                # Gradient w.r.t. the DFT bins of L; real/imag parts get
+                # independent Adam moments (the gradient is Hermitian, so
+                # the symmetry -- and hence the realness of L -- is kept).
+                gLf = np.fft.fft(grad_L, axis=-1) / L_len
+                mLf = b1 * mLf + (1 - b1) * gLf
+                vLr = b2 * vLr + (1 - b2) * gLf.real**2
+                vLi = b2 * vLi + (1 - b2) * gLf.imag**2
+                mh = mLf / (1 - b1**t)
+                vrh = vLr / (1 - b2**t); vih = vLi / (1 - b2**t)
+                Lf = Lf - step * (
+                    mh.real / (np.sqrt(vrh) + eps)
+                    + 1j * mh.imag / (np.sqrt(vih) + eps)
+                )
+                L = np.real(np.fft.ifft(Lf, axis=-1))
+            else:
+                mL = b1 * mL + (1 - b1) * grad_L
+                vL = b2 * vL + (1 - b2) * grad_L**2
+                mLh = mL / (1 - b1**t); vLh = vL / (1 - b2**t)
+                L = L - step * mLh / (np.sqrt(vLh) + eps)
             mM = b1 * mM + (1 - b1) * grad_M
             vM = b2 * vM + (1 - b2) * grad_M**2
-            mLh = mL / (1 - b1**t); vLh = vL / (1 - b2**t)
             mMh = mM / (1 - b1**t); vMh = vM / (1 - b2**t)
-            L = L - step * mLh / (np.sqrt(vLh) + eps)
             M = M - step * mMh / (np.sqrt(vMh) + eps)
         else:
             L = L - lr_L * grad_L * N  # paper's beta_L acts on the sum, not mean
@@ -199,3 +234,45 @@ def fit_monitor(
     resid = zhat - z
     result.nmse_db = float(10.0 * np.log10(np.mean(resid**2) / np.var(z)))
     return result
+
+
+def fit_monitor_hybrid(
+    xI: np.ndarray,
+    xQ: np.ndarray,
+    z: np.ndarray,
+    L_len: int,
+    M_len: int,
+    n_iter_freq: int = 8000,
+    n_iter_tap: int = 8000,
+    lr_freq: float = 2e-2,
+    lr_freq_final: float = 1e-6,
+    lr_tap: float = 1e-3,
+    lr_tap_final: float = 1e-7,
+    verbose_every: int = 0,
+) -> MonitorResult:
+    """Two-stage estimation: frequency-domain Adam, then tap-domain polish.
+
+    The MSE objective is badly conditioned across frequency: bins where
+    the drive spectrum (or the transmitter response) is weak see a
+    gradient smaller by the square of the excitation, so tap-domain
+    descent leaves them far from converged (poor accuracy near the band
+    edge). Stage 1 runs Adam on the DFT bins of Lhat, whose per-bin step
+    adaptation equalizes convergence across the whole excited band.
+    Stage 2 warm-starts tap-domain Adam from that solution: it restores
+    the precision of the strongly excited region (and of the derived IQ
+    metrics) while barely moving the band-edge bins, whose MSE
+    contribution is small.
+    """
+    stage1 = fit_monitor(
+        xI, xQ, z, L_len, M_len,
+        n_iter=n_iter_freq, lr=lr_freq, lr_final=lr_freq_final,
+        domain="freq", verbose_every=verbose_every,
+    )
+    stage2 = fit_monitor(
+        xI, xQ, z, L_len, M_len,
+        n_iter=n_iter_tap, lr=lr_tap, lr_final=lr_tap_final,
+        domain="tap", init_L=stage1.L, init_M=stage1.M,
+        verbose_every=verbose_every,
+    )
+    stage2.loss = stage1.loss + stage2.loss
+    return stage2

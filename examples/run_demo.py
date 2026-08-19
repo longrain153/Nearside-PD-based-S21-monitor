@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 
 from s21_monitor import (
     analyze_iq,
-    fit_monitor,
+    fit_monitor_hybrid,
     lowpass_fir,
     make_transmitter,
     photodetect,
@@ -83,13 +83,17 @@ def main():
     z = photodetect(yI, yQ, M_true, snr_db=30, rng=rng)
 
     # --- joint learning of COI and OC -------------------------------------
-    print("Fitting the monitor (8000 full-batch iterations)...")
+    # Two stages: frequency-domain Adam equalizes convergence across the
+    # band (accuracy at weakly excited band-edge frequencies), then a
+    # tap-domain polish restores full precision in the strongly excited
+    # region and in the derived IQ metrics.
+    print("Fitting the monitor (8000 freq-domain + 8000 tap-domain iterations)...")
     t0 = time.time()
-    res = fit_monitor(
+    res = fit_monitor_hybrid(
         xI, xQ, z,
         L_len=55, M_len=161,
-        n_iter=8000, lr=2e-2, lr_final=1e-5,
-        verbose_every=1000,
+        n_iter_freq=8000, n_iter_tap=8000,
+        verbose_every=2000,
     )
     print(f"done in {time.time() - t0:.0f} s, fit NMSE {res.nmse_db:.1f} dB")
 
@@ -121,7 +125,7 @@ def main():
     def norm_db(H):
         return 20 * np.log10(np.maximum(np.abs(H) / np.abs(H[0]), 1e-6))
 
-    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4))
     ax[0].plot(fghz[band], norm_db(HI_t)[band], "k-", label="true I branch")
     ax[0].plot(fghz[band], norm_db(HI_e)[band], "r--", label="estimated I branch")
     ax[0].plot(fghz[band], norm_db(HQ_t)[band], "b-", label="true Q branch")
@@ -144,6 +148,17 @@ def main():
     ax[1].set_title("Photodetector/ADC response (OC)")
     ax[1].legend(fontsize=8)
     ax[1].grid(alpha=0.3)
+
+    for name, Ht, He, color in (("I", HI_t, HI_e, "r"), ("Q", HQ_t, HQ_e, "g")):
+        err_db = norm_db(He)[band] - norm_db(Ht)[band]
+        ax[2].plot(fghz[band], err_db, color, label=f"{name} branch")
+    ax[2].set_xlabel("frequency (GHz)")
+    ax[2].set_ylabel("|S21| estimation error (dB)")
+    ax[2].set_ylim(-1, 1)
+    ax[2].set_title("COI magnitude error, signal band")
+    ax[2].legend(fontsize=8)
+    ax[2].grid(alpha=0.3)
+
     fig.suptitle("100 GBaud-class transmitter monitored through a 5 GHz PD")
     fig.tight_layout()
     fig.savefig(os.path.join(OUT_DIR, "responses.png"), dpi=150)

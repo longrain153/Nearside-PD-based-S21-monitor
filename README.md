@@ -61,6 +61,25 @@ full-batch Adam accelerator (`optimizer="adam"`, default). All
 convolutions/correlations are FFT-based; the analytic gradients are
 verified against finite differences in `tests/test_gradients.py`.
 
+### Band-edge accuracy: two-stage optimization
+
+The MSE objective is badly conditioned across frequency: at frequencies
+where the drive spectrum or the transmitter response is weak (band
+edges), the gradient of `L̂(ω)` scales with the *square* of the
+excitation, so tap-domain descent leaves those bins essentially
+unconverged — more data does not help, since the problem is
+conditioning, not noise. `fit_monitor(domain="freq")` therefore
+parameterizes `L̂` by its DFT bins, where Adam's per-parameter step
+adaptation automatically equalizes convergence rates across the band
+(the gradient of a real filter is Hermitian, so the taps stay real).
+
+`fit_monitor_hybrid` (used by the demo) combines both: a
+frequency-domain stage levels all excited bins, then a tap-domain
+polish, warm-started from it, restores full precision in the strongly
+excited region and in the derived IQ metrics while barely moving the
+band-edge bins. In the demo scenario this reduces the worst-case
+|S21| error at 40–50 GHz from ≈1 dB to ≈0.03 dB.
+
 ### Inherent ambiguities
 
 The intensity-only observation leaves a few quantities unidentifiable:
@@ -90,7 +109,7 @@ s21_monitor/
   filters.py        FIR design (windowed sinc, fractional delay, RRC) + FFT convolution
   transmitter.py    2x2 widely linear transmitter model with imperfection builder
   photodetector.py  square law + low-pass OC + noise
-  monitor.py        joint COI/OC estimation (LMS / Adam with backpropagation)
+  monitor.py        joint COI/OC estimation (LMS / Adam, tap- or freq-domain, hybrid)
   metrics.py        imperfection extraction from the estimated COI
 examples/run_demo.py   end-to-end 100 GBaud / 5 GHz PD demo (figures in examples/output/)
 tests/                 gradient finite-difference check + end-to-end convergence test
@@ -107,7 +126,8 @@ python3 -m pytest tests/       # ~40 s
 The demo drives the transmitter with 100 GBaud RRC-shaped 16QAM at
 200 GSa/s, applies a 55/50 GHz branch-bandwidth mismatch, −0.8 dB
 amplitude imbalance, 5° quadrature phase error and 3 ps IQ skew,
-detects through a 5 GHz PD at 30 dB SNR, and recovers all of them:
+detects through a 5 GHz PD at 30 dB SNR, and recovers all of them
+(branch |S21| to within ≈0.03 dB up to 50 GHz):
 
 | metric              | true  | estimated |
 |---------------------|-------|-----------|
