@@ -80,6 +80,7 @@ def fit_monitor(
     lr_M: float | None = None,
     init_L: np.ndarray | None = None,
     init_M: np.ndarray | None = None,
+    sample_every: int = 1,
     verbose_every: int = 0,
 ) -> MonitorResult:
     """Jointly estimate the COI Lhat[i,j,l] and the OC Mhat[m].
@@ -87,7 +88,12 @@ def fit_monitor(
     Parameters
     ----------
     xI, xQ : known digital drive signals of the transmitter.
-    z : sampled PD output (same rate and alignment as xI/xQ).
+    z : sampled PD output. With ``sample_every=1`` it is at the same
+        rate and alignment as xI/xQ; with ``sample_every=D > 1`` it is
+        the output of a low-rate ADC holding z[0], z[D], z[2D], ...
+        (see ``photodetect(decimate=...)``). The error is then evaluated
+        only at the sampled instants -- the gradient expressions are
+        unchanged, with err zero at the unsampled positions.
     L_len, M_len : estimated filter lengths (>= the true supports).
     n_iter : number of full-batch iterations over the snapshot.
     lr : Adam step size (used when optimizer="adam").
@@ -112,8 +118,14 @@ def fit_monitor(
     xQ = np.asarray(xQ, float)
     z = np.asarray(z, float)
     N = len(xI)
-    if len(xQ) != N or len(z) != N:
-        raise ValueError("xI, xQ and z must have equal length")
+    D = int(sample_every)
+    n_obs = len(range(0, N, D))
+    if len(xQ) != N:
+        raise ValueError("xI and xQ must have equal length")
+    if len(z) != n_obs:
+        raise ValueError(
+            f"z must have {n_obs} samples (len(xI)={N}, sample_every={D})"
+        )
 
     # --- initialization ---------------------------------------------------
     if init_L is not None:
@@ -128,7 +140,8 @@ def fit_monitor(
         M = np.zeros(M_len)
         M[(M_len - 1) // 2] = 1.0
         _, p0, z0 = _forward(L, M, xI, xQ, N)
-        g = float(np.dot(z0, z) / max(np.dot(z0, z0), 1e-30))
+        z0s = z0[::D]
+        g = float(np.dot(z0s, z) / max(np.dot(z0s, z0s), 1e-30))
         M *= g
 
     # Normalize the loss scale so step sizes are data-independent.
@@ -161,13 +174,23 @@ def fit_monitor(
     else:
         raise ValueError("optimizer must be 'adam' or 'gd'")
 
+    def _masked_err(zhat):
+        # Error at the ADC sampling instants, zero elsewhere -- the
+        # gradient sums then run over the sampled n only, exactly.
+        if D == 1:
+            e = zhat - z
+            return e, float(np.mean(e**2))
+        e = np.zeros(N)
+        es = zhat[::D] - z
+        e[::D] = es
+        return e, float(np.mean(es**2))
+
     result = MonitorResult(L=L, M=M)
     prev_loss = np.inf
     prev_L = prev_M = None
     for k in range(n_iter):
         y, p, zhat = _forward(L, M, xI, xQ, N)
-        err = zhat - z
-        loss = float(np.mean(err**2))
+        err, loss = _masked_err(zhat)
 
         if optimizer == "gd":
             # Bold-driver adaptation keeps plain gradient descent stable
@@ -178,7 +201,7 @@ def fit_monitor(
                 lr_L *= 0.5
                 lr_M *= 0.5
                 y, p, zhat = _forward(L, M, xI, xQ, N)
-                err = zhat - z
+                err, loss = _masked_err(zhat)
                 loss = prev_loss
             else:
                 lr_L *= 1.02
@@ -231,7 +254,7 @@ def fit_monitor(
 
     result.L, result.M = L, M
     _, _, zhat = _forward(L, M, xI, xQ, N)
-    resid = zhat - z
+    resid = zhat[::D] - z
     result.nmse_db = float(10.0 * np.log10(np.mean(resid**2) / np.var(z)))
     return result
 
@@ -248,6 +271,7 @@ def fit_monitor_hybrid(
     lr_freq_final: float = 1e-6,
     lr_tap: float = 1e-3,
     lr_tap_final: float = 1e-7,
+    sample_every: int = 1,
     verbose_every: int = 0,
 ) -> MonitorResult:
     """Two-stage estimation: frequency-domain Adam, then tap-domain polish.
@@ -266,13 +290,14 @@ def fit_monitor_hybrid(
     stage1 = fit_monitor(
         xI, xQ, z, L_len, M_len,
         n_iter=n_iter_freq, lr=lr_freq, lr_final=lr_freq_final,
-        domain="freq", verbose_every=verbose_every,
+        domain="freq", sample_every=sample_every,
+        verbose_every=verbose_every,
     )
     stage2 = fit_monitor(
         xI, xQ, z, L_len, M_len,
         n_iter=n_iter_tap, lr=lr_tap, lr_final=lr_tap_final,
         domain="tap", init_L=stage1.L, init_M=stage1.M,
-        verbose_every=verbose_every,
+        sample_every=sample_every, verbose_every=verbose_every,
     )
     stage2.loss = stage1.loss + stage2.loss
     return stage2
