@@ -162,3 +162,21 @@ blind identification. See `docs/dither_s21_calibration_report.pdf`
   phi = 0: magnitudes, imbalance, and skew via same-nu chain difference
 - `examples/pilot_dither_calibration.py`, `examples/pilot_phase_response.py`
   - earlier additive pilot-pair variants
+
+### Minimal scheme (final recommended form)
+
+Under the tightest constraints - no DSP data at the monitor (no
+decision-aided cancellation), shallow dither only (total <= -25 dB,
+EVM-neutral), free-running low-rate ADC - the full calibration cycle
+still delivers everything (see report section 5):
+
+- `examples/minimal_sweep.py` - swept slice AM (eps=0.4), no
+  cancellation: |S21| 0.010/0.031 dB, common quadratic phase RMS
+  0.16/0.23 rad, in ~0.13 s
+- `examples/minimal_skew_burst.py` - full-branch AM eps=0.08 skew burst
+  worker: sigma = 0.122 +- 0.009 ps at 62.9 ms/branch (48000-record
+  block statistics), 1/sqrt(T) verified 0.25-63 ms; 0.1 ps at ~0.19 s
+- `examples/precancel_scheme_a.py` - three-arm experiment showing the
+  data self-beat is NOT the dominant noise in this configuration
+  (exact-H pre-cancellation gains only ~5 dB), which is why the
+  no-cancellation minimal scheme works
