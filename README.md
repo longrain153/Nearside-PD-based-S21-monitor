@@ -141,3 +141,24 @@ response is unobservable and the estimate is unconstrained.
 
 Because transmitter imperfections drift slowly, the learning can run
 offline on captured snapshots and sleep between updates.
+
+## Dither-based swept calibration (active scheme)
+
+When the TX DSP may inject MHz-rate multiplicative dither on per-branch
+spectral slices, calibration becomes a lock-in measurement instead of
+blind identification. See `docs/dither_s21_calibration_report.pdf`
+(Chinese technical report: theory, simulation validation, and the
+0.1 ps skew feasibility analysis) and the examples:
+
+- `examples/swept_dither_calibration.py` - final swept scheme: per-branch
+  |S21|, absolute phase response (common quadratic recovered), and skew,
+  through a 100 MHz PD + ~195 MS/s in-band-ideal ADC, no mixer
+- `examples/skew_burst_90mhz.py` - dedicated skew burst (full-branch AM,
+  nu = 90 MHz, I/Q alternating): 0.35 ps at 0.66 ms/branch, ~61 ms/branch
+  extrapolates to 0.1 ps
+- `examples/dual_freq_skew_scaling.py` - sigma proportional to 1/sqrt(T)
+  scaling-law verification (earlier dual-frequency + swap configuration)
+- `examples/branch_bin_dither.py` - per-branch single-bin dither at
+  phi = 0: magnitudes, imbalance, and skew via same-nu chain difference
+- `examples/pilot_dither_calibration.py`, `examples/pilot_phase_response.py`
+  - earlier additive pilot-pair variants
