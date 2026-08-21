@@ -180,3 +180,31 @@ still delivers everything (see report section 5):
   data self-beat is NOT the dominant noise in this configuration
   (exact-H pre-cancellation gains only ~5 dB), which is why the
   no-cancellation minimal scheme works
+
+### Theory and a simulation-artifact correction
+
+`docs/dither_s21_calibration_report.pdf` now carries the full analytic
+derivation (section 2): the ABC power-series decomposition of the
+detected intensity in the dither depth, why only the `2*yd*dy` term has
+a non-zero mean at the readout bin, how the branch group delay enters
+that line's phase scaled by the aperture nu, and why `arg M(nu)` and the
+dither phase cancel exactly in the I/Q difference - so skew is
+measurable even though the square law contains no `y_I*y_Q` cross term.
+It also derives the precision limit `sigma ~ 1/(eps*nu*sqrt(T))` and the
+clock/interleaving requirements that follow from it.
+
+Section 6 documents a correction: the earlier simulations reused one
+data realization across measurements that are separate acquisitions in a
+real system (across sweep points, and across the I/Q dither records).
+Since the dominant noise (the data self-beat) depends only on the data
+and not on where the dither sits, reuse made it common-mode - which is
+mathematically equivalent to perfect TX-side pre-cancellation. The
+skew figures are therefore relabelled: 0.122 ps / 0.19 s describes a
+pre-cancelled system, while the zero-TX-change minimal scheme measures
+0.563 ps at 62.9 ms/branch and needs ~4.0 s for 0.1 ps. Pre-cancellation
+is correspondingly worth 4.8x in sigma (22.7x in time), not the 1.8x
+previously reported.
+
+- `examples/skew_decorrelation_study.py` - shared vs independent I/Q
+  records, with an optional perfect-pre-cancellation arm
+- `examples/sweep_decorrelation_study.py` - same study for the sweep
