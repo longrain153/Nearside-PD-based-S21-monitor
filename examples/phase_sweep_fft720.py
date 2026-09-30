@@ -85,7 +85,7 @@ levels = np.array([-3.0, -1.0, 1.0, 3.0])
 S_rrc = np.abs(np.fft.rfft(rrc, N)) ** 2
 w_adc = np.hanning(Nd)
 n_adc = np.arange(Nd)
-t_blk = (np.arange(NB) + 0.5) * BLK / fs           # block centres in record
+t_blk = (np.arange(NB) * BLK + (BLK - 1) / 2) / fs   # block centres (sample n is at n/fs)
 bin_masks = [np.zeros(BLK // 2 + 1, bool) for _ in range(K)]
 for k in range(K):
     bin_masks[k][k * NBIN_SLICE:(k + 1) * NBIN_SLICE] = True
@@ -159,9 +159,16 @@ def main():
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--out", default="phase_sweep_fft720")
     ap.add_argument("--replot", action="store_true")
+    ap.add_argument("--recompute", action="store_true",
+                    help="re-derive everything from the stored lock-in outputs")
+    ap.add_argument("--legacy-half-sample", action="store_true",
+                    help="with --recompute: file was made before the block-centre fix")
     a = ap.parse_args()
     if a.replot:
         make_figure(a.out)
+        return
+    if a.recompute:
+        recompute(a.out, a.legacy_half_sample)
         return
 
     eps = a.eps_slice
@@ -204,6 +211,22 @@ def main():
     B_I, B_Q = B[0::2], B[1::2]
     sig_ph_I = sem[0::2] / np.abs(B_I)
     sig_ph_Q = sem[1::2] / np.abs(B_Q)
+    res = analyze(B_I, B_Q, sig_ph_I, sig_ph_Q)
+    res.update(spec=spec, eps=eps, t_slice_ms=a.t_slice_ms, frac_db=10 * np.log10(frac.max()),
+               B_I=B_I, B_Q=B_Q, sig_ph_I=sig_ph_I, sig_ph_Q=sig_ph_Q)
+    np.savez(a.out + ".npz", **res)
+    report(res)
+    make_figure(a.out)
+
+
+def _H_shift(Hb):
+    """H(f + nu) on the fine grid by complex linear interpolation (nu is not
+    an integer number of fine bins for this record length)."""
+    return (np.interp(freqs + nu, freqs, Hb.real, right=0.0)
+            + 1j * np.interp(freqs + nu, freqs, Hb.imag, right=0.0))
+
+
+def analyze(B_I, B_Q, sig_ph_I, sig_ph_Q):
     tau_I = (np.angle(M_nu) - np.angle(B_I)) / (2 * np.pi * nu)
     tau_Q = (np.angle(M_nu) - np.angle(B_Q)) / (2 * np.pi * nu)
     sig_tau_I = sig_ph_I / (2 * np.pi * nu)
@@ -214,13 +237,13 @@ def main():
     sig_th_Q = 2 * np.pi * Delta * np.sqrt(np.concatenate(([0.0], np.cumsum(sig_tau_Q ** 2))))
 
     # truth: slice-weighted line (sharp mask on the fine grid) and exact phase
-    m_fine = int(round(nu / freqs[1]))
+    HII_s, HQQ_s = _H_shift(HII), _H_shift(HQQ)
 
-    def line(Hb, k):
+    def line(Hb, Hs, k):
         m = (freqs >= edges[k]) & (freqs < edges[k + 1])
-        return np.sum(S_rrc * m * np.roll(Hb, -m_fine) * np.conj(Hb))
-    tauI_t = np.array([-np.angle(line(HII, k)) / (2 * np.pi * nu) for k in range(K)])
-    tauQ_t = np.array([-np.angle(line(HQQ, k)) / (2 * np.pi * nu) for k in range(K)])
+        return np.sum(S_rrc * m * Hs * np.conj(Hb))
+    tauI_t = np.array([-np.angle(line(HII, HII_s, k)) / (2 * np.pi * nu) for k in range(K)])
+    tauQ_t = np.array([-np.angle(line(HQQ, HQQ_s, k)) / (2 * np.pi * nu) for k in range(K)])
     idx = [int(round(e / freqs[1])) for e in edges]
     thI_t = np.unwrap(np.angle(HII))[idx]; thI_t -= thI_t[0]
     thQ_t = np.unwrap(np.angle(HQQ))[idx]; thQ_t -= thQ_t[0]
@@ -235,33 +258,62 @@ def main():
     w = 1 / sig_d[inner] ** 2
     skew = np.sum(w * d_tau[inner]) / np.sum(w)
     skew_sig = 1 / np.sqrt(np.sum(w))
+    skew_t = np.mean(d_tau_t[inner])
+    return dict(tau_I=tau_I, tau_Q=tau_Q, sig_tau_I=sig_tau_I, sig_tau_Q=sig_tau_Q,
+                tauI_t=tauI_t, tauQ_t=tauQ_t, th_I=th_I, th_Q=th_Q, sig_th_I=sig_th_I,
+                sig_th_Q=sig_th_Q, thI_t=thI_t, thQ_t=thQ_t, edges=edges, tau_ref=tau_ref,
+                pI=pI, pQ=pQ, skew=skew, skew_sig=skew_sig, skew_t=skew_t, d_tau=d_tau,
+                d_tau_t=d_tau_t, sig_d=sig_d)
 
+
+def report(r):
+    fc = edges[:-1] + Delta / 2
     fit_th = lambda p: -2 * np.pi * (p[0] * edges ** 2 / 2 + p[1] * edges)  # noqa: E731
+    tau_ref = r["tau_ref"]
     print("\nper-slice group delay (ps), bulk delay removed:")
     print("  f(GHz)   tau_I meas   true    tau_Q meas   true    dtau meas  true   sigma")
     for k in range(K):
-        print(f"  {fc[k] / 1e9:5.1f}  {(tau_I[k] - tau_ref) * 1e12:9.2f} {(tauI_t[k] - tau_ref) * 1e12:8.2f}"
-              f"  {(tau_Q[k] - tau_ref) * 1e12:9.2f} {(tauQ_t[k] - tau_ref) * 1e12:8.2f}"
-              f"  {d_tau[k] * 1e12:8.2f} {d_tau_t[k] * 1e12:6.2f}  {sig_d[k] * 1e12:5.2f}")
-    print(f"tau_g RMS err: I {np.std(tau_I - tauI_t) * 1e12:.2f} ps, Q {np.std(tau_Q - tauQ_t) * 1e12:.2f} ps "
-          f"(predicted sigma ~{np.mean(sig_tau_I) * 1e12:.2f} ps)")
-    print(f"accumulated phase: err at 50 GHz I {th_I[-1] - thI_t[-1]:+.3f} rad (sigma {sig_th_I[-1]:.3f}), "
-          f"Q {th_Q[-1] - thQ_t[-1]:+.3f} rad (sigma {sig_th_Q[-1]:.3f})")
-    print(f"2-parameter fit:   err at 50 GHz I {fit_th(pI)[-1] - thI_t[-1]:+.3f} rad, "
-          f"Q {fit_th(pQ)[-1] - thQ_t[-1]:+.3f} rad; curvature est I {-pI[0] * 2 * np.pi * F_EDGE ** 2 / 2:.3f} rad, "
-          f"Q {-pQ[0] * 2 * np.pi * F_EDGE ** 2 / 2:.3f} rad (true -6)")
-    print(f"skew (interior slices, weighted): {skew * 1e12:+.3f} +- {skew_sig * 1e12:.3f} ps  "
-          f"(true {np.mean(d_tau_t[inner]) * 1e12:.3f} ps, nominal {SKEW_PS} ps)")
+        print(f"  {fc[k] / 1e9:5.1f}  {(r['tau_I'][k] - tau_ref) * 1e12:9.2f} {(r['tauI_t'][k] - tau_ref) * 1e12:8.2f}"
+              f"  {(r['tau_Q'][k] - tau_ref) * 1e12:9.2f} {(r['tauQ_t'][k] - tau_ref) * 1e12:8.2f}"
+              f"  {r['d_tau'][k] * 1e12:8.2f} {r['d_tau_t'][k] * 1e12:6.2f}  {r['sig_d'][k] * 1e12:5.2f}")
+    print(f"tau_g RMS err: I {np.std(r['tau_I'] - r['tauI_t']) * 1e12:.2f} ps, "
+          f"Q {np.std(r['tau_Q'] - r['tauQ_t']) * 1e12:.2f} ps "
+          f"(predicted sigma ~{np.mean(r['sig_tau_I']) * 1e12:.2f} ps)")
+    eI = r["th_I"] - r["thI_t"]; eQ = r["th_Q"] - r["thQ_t"]
+    print(f"accumulated phase: err at 50 GHz I {eI[-1]:+.3f} rad (sigma {r['sig_th_I'][-1]:.3f}), "
+          f"Q {eQ[-1]:+.3f} rad (sigma {r['sig_th_Q'][-1]:.3f}); "
+          f"max |err| over edges I {np.max(np.abs(eI)):.3f}, Q {np.max(np.abs(eQ)):.3f} rad")
+    print(f"2-parameter fit:   err at 50 GHz I {fit_th(r['pI'])[-1] - r['thI_t'][-1]:+.3f} rad, "
+          f"Q {fit_th(r['pQ'])[-1] - r['thQ_t'][-1]:+.3f} rad; curvature est "
+          f"I {-r['pI'][0] * 2 * np.pi * F_EDGE ** 2 / 2:.3f} rad, "
+          f"Q {-r['pQ'][0] * 2 * np.pi * F_EDGE ** 2 / 2:.3f} rad (true -6)")
+    print(f"skew (interior slices, weighted): {r['skew'] * 1e12:+.3f} +- {r['skew_sig'] * 1e12:.3f} ps  "
+          f"(true {r['skew_t'] * 1e12:.3f} ps, nominal {SKEW_PS} ps)")
     print(f"time to reach 0.1 ps skew at this dither depth: "
-          f"{a.t_slice_ms * (skew_sig * 1e12 / 0.1) ** 2 * 2 * K / 1e3:.1f} s total")
+          f"{r['t_slice_ms'] * (r['skew_sig'] * 1e12 / 0.1) ** 2 * 2 * K / 1e3:.1f} s total")
 
-    np.savez(a.out + ".npz", spec=spec, B_I=B_I, B_Q=B_Q, tau_I=tau_I, tau_Q=tau_Q,
-             sig_tau_I=sig_tau_I, sig_tau_Q=sig_tau_Q, tauI_t=tauI_t, tauQ_t=tauQ_t,
-             th_I=th_I, th_Q=th_Q, sig_th_I=sig_th_I, sig_th_Q=sig_th_Q,
-             thI_t=thI_t, thQ_t=thQ_t, edges=edges, tau_ref=tau_ref, pI=pI, pQ=pQ,
-             skew=skew, skew_sig=skew_sig, d_tau=d_tau, d_tau_t=d_tau_t, sig_d=sig_d,
-             eps=eps, t_slice_ms=a.t_slice_ms, frac_db=10 * np.log10(frac.max()))
-    make_figure(a.out)
+
+def recompute(out, legacy_half_sample=False):
+    d = dict(np.load(out + ".npz"))
+    for k, v in d.items():
+        if v.ndim == 0:
+            d[k] = v.item()
+    if legacy_half_sample:
+        # files produced before the block-centre fix: the dither phase led by
+        # half a sample (2.5 ps); rotate the lock-in outputs back (exact for a
+        # single-tone dither, common to both branches and all slices).
+        rot = np.exp(-2j * np.pi * nu * 0.5 / fs)
+        d["B_I"] = d["B_I"] * rot
+        d["B_Q"] = d["B_Q"] * rot
+    if "sig_ph_I" not in d:                          # older file layout
+        d["sig_ph_I"] = d["sig_tau_I"] * 2 * np.pi * nu
+        d["sig_ph_Q"] = d["sig_tau_Q"] * 2 * np.pi * nu
+    res = analyze(d["B_I"], d["B_Q"], d["sig_ph_I"], d["sig_ph_Q"])
+    for k in ("spec", "eps", "t_slice_ms", "frac_db", "B_I", "B_Q", "sig_ph_I", "sig_ph_Q"):
+        res[k] = d[k]
+    np.savez(out + ".npz", **res)
+    report(res)
+    make_figure(out)
 
 
 def make_figure(out):
