@@ -1,7 +1,8 @@
-"""乘性导频 S21 监测：自包含的原理演示（只依赖 numpy + matplotlib）
+"""乘性导频 S21 监测：自包含的原理演示 —— 打开本文件直接按 F5 运行即可
 
-运行:  python standalone_pilot_demo.py          （4 核约 1.5 分钟，单核约 5 分钟）
-输出:  standalone_pilot_demo.png + 终端里的数字
+- 只用 numpy + matplotlib，缺了会自动 pip 安装
+- 运行中每隔几秒打印一次当前估计值，结束时弹出结果图并保存 standalone_pilot_demo.png
+- 4 核约 2 分钟，单核约 6 分钟（Spyder 里多进程不可用时自动改单进程）
 
 链路（每条 1 µs 记录都按 200 GS/s 逐样本仿真，数据每次新生成）:
 
@@ -16,18 +17,25 @@
   数据相位抵消，剩下 θ(f+ν)−θ(f) = −2πν·τ_g(f)。所有 f 叠在 ν 一根线上，
   谱线相位 = 被调制频段的平均群时延。I/Q 相减得 skew；逐片扫描、逐片累加得相频。
 
-调制深度故意设得很深（先不考虑对主数据流的代价），好让结果几十毫秒内就收敛。
+调制深度故意设得很深（先不考虑对主数据流的代价），好让结果十几毫秒内就收敛。
 """
 import os
+import subprocess
 import sys
 import time
-from multiprocessing import Pool, cpu_count, freeze_support
 
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_v, "1")          # 每个进程单线程，多进程并行更快
-import numpy as np
 
-# ------------------------------------------------------------------ 参数
+try:
+    import numpy as np
+    import matplotlib
+except ImportError:                          # 缺库就自动装
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "matplotlib"])
+    import numpy as np
+    import matplotlib
+
+# ------------------------------------------------------------------ 可调参数
 fs = 200e9                 # 波形采样率 (200 GS/s)
 N = 200_000                # 每条记录 1 µs
 D_ADC = 1000               # 200 GS/s / 1000 = 200 MS/s
@@ -36,13 +44,15 @@ fs_adc = fs / D_ADC
 nu = 90e6                  # 导频频率：1 µs 内整 90 个周期，记录之间相位自动连续
 BAUD = 100e9               # 100 GBaud 16QAM，2 sps，RRC 0.1
 QUAD_RAD, F_EDGE = 6.0, 50e9   # 公共二次相频：50 GHz 处 −6 rad
-SKEW_PS = 3.0              # Q 比 I 晚 3 ps（想试 0.3 ps 把时间加长 100 倍）
-EPS_BURST = 0.5            # 全带 burst 的调制深度（测 skew）
-EPS_SLICE = 1.2            # 分片扫描的调制深度（测相频）
-T_BURST_MS = 1.5           # burst：每支路积分时间
-T_SLICE_MS = 1.5           # 扫描：每片每支路积分时间
+SKEW_PS = 3.0              # Q 比 I 晚 3 ps（想试 0.3 ps 把两个时间各加长 100 倍）
+EPS_BURST = 1.0            # 全带 burst 的调制深度（测 skew）
+EPS_SLICE = 1.5            # 分片扫描的调制深度（测相频）
+T_BURST_MS = 1.0           # burst：每支路积分时间
+T_SLICE_MS = 1.0           # 扫描：每片每支路积分时间
 K = 5                      # 片数，5 × 10 GHz 铺满 0–50 GHz
 SNR_ADC_DB = 30            # ADC 热噪声相对 PD 输出交流功率
+USE_MULTIPROCESSING = True # Spyder 等环境里失败时会自动退回单进程
+CHUNK = 100                # 每批记录数，决定打印进度的频率
 
 f = np.fft.rfftfreq(N, 1 / fs)          # 记录内频率网格，1 MHz 一格
 t = np.arange(N) / fs
@@ -111,14 +121,15 @@ def one_record(rng, branch, mask, eps, noise_std):
 
 
 def worker(args):
-    seed, n_rec, schedule, masks, eps, noise_std = args
+    """算一批记录，按 schedule 轮流给不同的 (支路, 片) 加导频"""
+    seed, start, n_rec, schedule, masks, eps, noise_std = args
     rng = np.random.default_rng(seed)
     acc = np.zeros(len(schedule), complex)
     acc2 = np.zeros(len(schedule))
     cnt = np.zeros(len(schedule), int)
     spec = np.zeros(Nd // 2 + 1)
     for i in range(n_rec):
-        s = i % len(schedule)
+        s = (start + i) % len(schedule)
         branch, k = schedule[s]
         B, sp = one_record(rng, branch, masks[k], eps, noise_std)
         acc[s] += B
@@ -129,30 +140,56 @@ def worker(args):
     return acc, acc2, cnt, spec
 
 
-def run(schedule, masks, eps, noise_std, t_ms, procs, seed0):
+class Accumulator:
+    def __init__(self, n_slots):
+        self.acc = np.zeros(n_slots, complex)
+        self.acc2 = np.zeros(n_slots)
+        self.cnt = np.zeros(n_slots, int)
+        self.spec = np.zeros(Nd // 2 + 1)
+
+    def add(self, out):
+        self.acc += out[0]; self.acc2 += out[1]; self.cnt += out[2]; self.spec += out[3]
+
+    def result(self):
+        B = self.acc / np.maximum(self.cnt, 1)
+        var = np.maximum(self.acc2 / np.maximum(self.cnt, 1) - np.abs(B) ** 2, 0)
+        sem = np.sqrt(var / np.maximum(self.cnt, 1) / 2)       # 每个正交分量的标准误
+        return B, sem / np.maximum(np.abs(B), 1e-30), self.spec / max(1, self.cnt[0])
+
+
+def run(schedule, masks, eps, noise_std, t_ms, seed0, report):
+    """跑完 len(schedule)*t_ms 毫秒的信号，每批结束调用 report(B, sig_phase, 已用秒数)"""
     n_total = int(round(len(schedule) * t_ms * 1e-3 * fs / N))
-    per = (n_total + procs - 1) // procs
-    jobs = [(seed0 + j, per, schedule, masks, eps, noise_std) for j in range(procs)]
+    jobs = [(seed0 + j, j * CHUNK, min(CHUNK, n_total - j * CHUNK), schedule, masks, eps, noise_std)
+            for j in range((n_total + CHUNK - 1) // CHUNK)]
+    A = Accumulator(len(schedule))
     t0 = time.time()
-    if procs > 1:
-        with Pool(procs) as pool:
-            outs = pool.map(worker, jobs)
-    else:
-        outs = [worker(j) for j in jobs]
-    acc = sum(o[0] for o in outs)
-    acc2 = sum(o[1] for o in outs)
-    cnt = sum(o[2] for o in outs)
-    spec = sum(o[3] for o in outs) / max(1, cnt[0])
-    B = acc / cnt
-    sem = np.sqrt(np.maximum(acc2 / cnt - np.abs(B) ** 2, 0) / cnt / 2)   # 每个正交分量的标准误
-    sig_phase = sem / np.abs(B)
-    print(f"   {cnt.sum()} 条记录（{cnt.sum() * N / fs * 1e3:.1f} ms 信号）用时 {time.time() - t0:.0f} s")
-    return B, sig_phase, spec
+    pool = None
+    if USE_MULTIPROCESSING:
+        try:
+            from multiprocessing import Pool, cpu_count
+            pool = Pool(max(1, min(8, cpu_count())))
+            it = pool.imap_unordered(worker, jobs)
+        except Exception as e:                       # 例如 Spyder 下无法 spawn
+            print(f"   多进程不可用（{e}），改用单进程")
+            pool = None
+    if pool is None:
+        it = map(worker, jobs)
+    last = 0.0
+    for out in it:
+        A.add(out)
+        if time.time() - last > 3 or A.cnt.sum() == n_total:
+            last = time.time()
+            B, sig, _ = A.result()
+            report(B, sig, A.cnt.sum(), n_total, time.time() - t0)
+    if pool is not None:
+        pool.close(); pool.join()
+    return A.result()
 
 
 def main():
-    procs = max(1, min(4, cpu_count()))
-    print(f"ν = {nu / 1e6:.0f} MHz，ADC {fs_adc / 1e6:.0f} MS/s，PD 100 MHz，{procs} 个进程")
+    print(f"ν = {nu / 1e6:.0f} MHz，ADC {fs_adc / 1e6:.0f} MS/s，PD 100 MHz，"
+          f"设定 skew {SKEW_PS} ps，二次相频 {QUAD_RAD:.0f} rad @ {F_EDGE / 1e9:.0f} GHz")
 
     # ADC 热噪声标定（不加导频时的 PD 输出交流功率）
     rng = np.random.default_rng(0)
@@ -161,34 +198,41 @@ def main():
     noise_std = np.sqrt(np.var(z0) * 10 ** (-SNR_ADC_DB / 10))
     _, spec_off = one_record(rng, 0, None, 0.0, noise_std)
 
-    # ============ Part A：全带 burst 测 skew（I、Q 交替）
-    print(f"\n[A] 全带 burst，ε = {EPS_BURST}，每支路 {T_BURST_MS} ms")
-    B, sig, spec_on = run([(0, 0), (1, 0)], [None], EPS_BURST, noise_std, T_BURST_MS, procs, 100)
-    skew_A = -np.angle(B[1] * np.conj(B[0])) / (2 * np.pi * nu)
-    skew_A_sig = np.sqrt(sig[0] ** 2 + sig[1] ** 2) / (2 * np.pi * nu)
-    # 全带 burst 的理论值：两路各自按权重 S|H(f)||H(f+ν)| 平均的群时延之差
+    # 真值：谱线理论上对应的加权平均群时延
     def line_tau(H, mask):
         Hs = np.interp(f + nu, f, H.real, right=0) + 1j * np.interp(f + nu, f, H.imag, right=0)
         return -np.angle(np.sum(RRC ** 2 * mask * Hs * np.conj(H))) / (2 * np.pi * nu)
-    full = np.ones_like(f)
-    skew_A_true = line_tau(H_Q, full) - line_tau(H_I, full)
-    print(f"   skew 估计 {skew_A * 1e12:+.2f} ± {skew_A_sig * 1e12:.2f} ps   "
-          f"（谱线理论值 {skew_A_true * 1e12:+.2f} ps，设定 {SKEW_PS} ps）")
+
+    # ============ Part A：全带 burst 测 skew（I、Q 交替）
+    print(f"\n[A] 全带 burst，ε = {EPS_BURST}，每支路 {T_BURST_MS} ms（skew 的真值 {SKEW_PS} ps）")
+
+    def rep_a(B, sig, n, n_total, sec):
+        sk = -np.angle(B[1] * np.conj(B[0])) / (2 * np.pi * nu)
+        ss = np.sqrt(sig[0] ** 2 + sig[1] ** 2) / (2 * np.pi * nu)
+        print(f"   {n:5d}/{n_total} 条记录 {sec:4.0f} s   skew = {sk * 1e12:+.2f} ± {ss * 1e12:.2f} ps")
+    B, sig, spec_on = run([(0, 0), (1, 0)], [None], EPS_BURST, noise_std, T_BURST_MS, 100, rep_a)
+    skew_A = -np.angle(B[1] * np.conj(B[0])) / (2 * np.pi * nu)
+    skew_A_sig = np.sqrt(sig[0] ** 2 + sig[1] ** 2) / (2 * np.pi * nu)
 
     # ============ Part B：分片扫描测相频（每片 I、Q 各测一次）
     print(f"\n[B] {K} 片 × {Delta / 1e9:.0f} GHz 扫描，ε_s = {EPS_SLICE}，每片每支路 {T_SLICE_MS} ms")
     masks = [((f >= edges[k]) & (f < edges[k + 1])).astype(float) for k in range(K)]
     schedule = [(b, k) for k in range(K) for b in (0, 1)]
-    B, sig, _ = run(schedule, masks, EPS_SLICE, noise_std, T_SLICE_MS, procs, 900)
+    tau_true = np.array([[line_tau(H, masks[k]) for H in (H_I, H_Q)] for k in range(K)])
+
+    def rep_b(B, sig, n, n_total, sec):
+        Bk = B.reshape(K, 2)
+        d = -np.angle(Bk[:, 1] * np.conj(Bk[:, 0])) / (2 * np.pi * nu)
+        print(f"   {n:5d}/{n_total} 条记录 {sec:4.0f} s   各片 Δτ(ps) = "
+              + " ".join(f"{x * 1e12:+5.2f}" for x in d))
+    B, sig, _ = run(schedule, masks, EPS_SLICE, noise_std, T_SLICE_MS, 900, rep_b)
     B = B.reshape(K, 2)
     sig = sig.reshape(K, 2)
     tau = -np.angle(B) / (2 * np.pi * nu)                 # 每片每支路的群时延（含 M 和 NCO 的共同常数）
     sig_tau = sig / (2 * np.pi * nu)
-    tau_true = np.array([[line_tau(H, masks[k]) for H in (H_I, H_Q)] for k in range(K)])
     # 绝对延迟只能测到模 1/ν，且含 M(ν) 和 NCO 的共同常数：共同延迟本来就不可观测。
     # 测量值和真值各自减掉自己 I 路第 0 片的群时延（同一个线性参考项），只比较形状。
-    ref = tau[0, 0]
-    ref_true = tau_true[0, 0]
+    ref, ref_true = tau[0, 0], tau_true[0, 0]
     tau = tau - ref
     tau_true = tau_true - ref_true
     # 逐片累加 → 相频（望远镜恒等式）
@@ -203,6 +247,8 @@ def main():
     w = 1 / sig_d ** 2
     skew_B = np.sum(w * d_tau) / np.sum(w)
     skew_B_sig = 1 / np.sqrt(np.sum(w))
+
+    print("\n================ 结果 ================")
     print("   片中心(GHz)  τ_I 测/真 (ps)      τ_Q 测/真 (ps)      Δτ (ps)")
     for k in range(K):
         print(f"   {fc[k] / 1e9:6.0f}   {tau[k, 0] * 1e12:7.2f} / {tau_true[k, 0] * 1e12:6.2f}"
@@ -210,12 +256,10 @@ def main():
               f"   {d_tau[k] * 1e12:+.2f} ± {sig_d[k] * 1e12:.2f}")
     print(f"   相频在 50 GHz 处：I 测 {th[-1, 0]:+.3f} / 真 {th_true[-1, 0]:+.3f} rad，"
           f"Q 测 {th[-1, 1]:+.3f} / 真 {th_true[-1, 1]:+.3f} rad（σ ≈ {sig_th[-1, 0]:.3f}）")
-    print(f"   skew（逐片差分加权平均）{skew_B * 1e12:+.2f} ± {skew_B_sig * 1e12:.2f} ps（设定 {SKEW_PS} ps）")
+    print(f"   skew：全带 burst {skew_A * 1e12:+.2f} ± {skew_A_sig * 1e12:.2f} ps，"
+          f"逐片差分 {skew_B * 1e12:+.2f} ± {skew_B_sig * 1e12:.2f} ps（设定 {SKEW_PS} ps）")
 
     # ============ 画图
-    import matplotlib
-    if "--show" not in sys.argv:
-        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(2, 2, figsize=(13, 9))
     fa = np.fft.rfftfreq(Nd, 1 / fs_adc) / 1e6
@@ -252,12 +296,13 @@ def main():
     fig.suptitle("Multiplicative pilot at 90 MHz, PD 100 MHz, ADC 200 MS/s, live 16QAM 100 GBaud, fresh data every record",
                  fontsize=11)
     fig.tight_layout()
-    fig.savefig("standalone_pilot_demo.png", dpi=130)
-    print("\n图已保存: standalone_pilot_demo.png")
-    if "--show" in sys.argv:
-        plt.show()
+    out_png = os.path.join(os.path.dirname(os.path.abspath(__file__)), "standalone_pilot_demo.png")
+    fig.savefig(out_png, dpi=130)
+    print(f"\n图已保存: {out_png}")
+    plt.show()
 
 
 if __name__ == "__main__":
+    from multiprocessing import freeze_support
     freeze_support()
     main()
